@@ -4,3 +4,5 @@ opencv-python-headless
 pytesseract
 deepface
 rapidfuzz
+tensorflow
+tf-keras
