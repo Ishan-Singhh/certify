@@ -1,1 +1,6 @@
 fastapi[all]
+pillow
+opencv-python-headless
+pytesseract
+deepface
+rapidfuzz
