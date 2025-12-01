@@ -6,3 +6,4 @@ deepface
 rapidfuzz
 tensorflow
 tf-keras
+tesseract
