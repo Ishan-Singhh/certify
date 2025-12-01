@@ -1,37 +1,71 @@
 # app.py
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+import os
+import re
 import tempfile
 import shutil
-import os
-from typing import Tuple
-from concurrent.futures import ThreadPoolExecutor
 import asyncio
+from typing import Optional, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor
 
-# image / OCR / face libs
-from deepface import DeepFace
-import cv2
+import requests
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
 from PIL import Image, ImageOps
+import cv2
 import pytesseract
-import re
+from deepface import DeepFace
 from rapidfuzz import fuzz
 
-# ---------- Utility functions (adapted from your notebook) ----------
+# ---------- Config ----------
+# Number of threads for blocking CPU work (OCR / DeepFace / OpenCV)
+EXECUTOR_WORKERS = 4
 
-def save_upload_to_temp(upload_file: UploadFile) -> str:
-    """Save an UploadFile to a temporary file and return its path."""
-    suffix = os.path.splitext(upload_file.filename)[1] or ".jpg"
+# Default thresholds (internal, fixed)
+BLUR_THRESHOLD = 1000.0
+BLANK_STDDEV_THRESHOLD = 10.0
+NAME_MATCH_THRESHOLD = 80
+ADDRESS_MATCH_THRESHOLD = 80
+
+# ---------- App ----------
+app = FastAPI(title="Certificate Verification ")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # restrict in production
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+executor = ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
+
+# ---------- Helper utilities ----------
+
+def download_url_to_temp(url: str, suffix: str = ".jpg", timeout: int = 15) -> str:
+    """Download an image from a URL to a temporary file and return its path."""
+    try:
+        resp = requests.get(url, stream=True, timeout=timeout)
+        resp.raise_for_status()
+    except Exception as e:
+        raise ValueError(f"Failed to download {url}: {e}")
+
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
-        shutil.copyfileobj(upload_file.file, tmp)
+        shutil.copyfileobj(resp.raw, tmp)
         tmp.flush()
         tmp.close()
     finally:
-        upload_file.file.close()
+        resp.close()
     return tmp.name
 
-def is_blurry_path(image_path: str, threshold: float = 1000.0) -> Tuple[bool, float]:
+def cleanup_file(path: str):
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+def is_blurry_path(image_path: str, threshold: float = BLUR_THRESHOLD) -> Tuple[bool, float]:
     """Return (is_blurry, variance). True if variance < threshold."""
     image = cv2.imread(image_path)
     if image is None:
@@ -41,7 +75,7 @@ def is_blurry_path(image_path: str, threshold: float = 1000.0) -> Tuple[bool, fl
     variance = float(lap.var())
     return variance < threshold, variance
 
-def is_blank_path(image_path: str, threshold: float = 10.0) -> Tuple[bool, float]:
+def is_blank_path(image_path: str, threshold: float = BLANK_STDDEV_THRESHOLD) -> Tuple[bool, float]:
     """Return (is_blank, stddev). True if stddev < threshold."""
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
@@ -67,21 +101,21 @@ def extract_text_path(image_path: str, lang: str = "eng+hin") -> str:
         (gray_image.width * scale_factor, gray_image.height * scale_factor),
         resample=Image.LANCZOS
     )
-    # psm 3 is what you used; tune as needed
     raw = pytesseract.image_to_string(resized_image, config="--psm 3", lang=lang)
     return normalize_text(raw)
 
-def verify_photo_paths(cert_path: str, selfie_path: str, model_name: str = "VGG-Face", detector_backend: str = "opencv"):
-    """Return DeepFace.verify dict (may take time)."""
-    # DeepFace.verify returns a dict with 'verified' boolean and distance etc.
+def verify_photo_paths(cert_path: str, selfie_path: str, model_name: str = "VGG-Face", detector_backend: str = "retinaface") -> Dict[str, Any]:
+    """Run DeepFace.verify and return the result dict."""
+    # DeepFace.verify returns a dict with 'verified' boolean and additional metrics
     return DeepFace.verify(img1_path=cert_path, img2_path=selfie_path, model_name=model_name, detector_backend=detector_backend)
 
-def verify_name_in_text(ocr_text: str, name: str, threshold: int = 80) -> dict:
-    """Return (match_bool, avg_score, candidates) for name verification."""
+def verify_name_in_text(ocr_text: str, name: str, threshold: int = NAME_MATCH_THRESHOLD) -> Dict[str, Any]:
+    """Return structured info about name matching."""
     t = ocr_text.replace('\n', ' ')
     t = re.sub(r'\s{2,}', ' ', t)
     name_candidates = []
 
+    # Try several heuristics to extract name candidates
     m = re.search(r'This\s+is\s+to\s+certify\s+that\s+(.{2,80}?)\s+(?:son|daughter)\b', t, flags=re.IGNORECASE)
     if m:
         candidate = m.group(1).strip()
@@ -96,75 +130,65 @@ def verify_name_in_text(ocr_text: str, name: str, threshold: int = 80) -> dict:
     if m3:
         name_candidates.append(m3.group(1).strip())
 
-    # fallback: try to pick capitalized words sequences
+    # fallback: pick sequences of 2-3 capitalized words
     if not name_candidates:
-        # crude fallback: find sequences of 2-3 capitalized words
         caps = re.findall(r'\b[A-Z][a-z]{1,}\s+[A-Z][a-z]{1,}(?:\s+[A-Z][a-z]{1,})?\b', ocr_text)
         name_candidates.extend(caps[:3])
 
-    # compute average partial ratio
     scores = []
     for cand in name_candidates:
         if cand:
             scores.append(fuzz.partial_ratio(name.lower(), cand.lower()))
-    avg = sum(scores) / len(scores) if scores else 0.0
+    avg = float(sum(scores) / len(scores)) if scores else 0.0
     matched = avg > threshold
     return {"matched": matched, "avg_score": avg, "candidates": name_candidates, "scores": scores}
 
-def verify_address_in_text(ocr_text: str, address: str, threshold: int = 80) -> dict:
+def verify_address_in_text(ocr_text: str, address: str, threshold: int = ADDRESS_MATCH_THRESHOLD) -> Dict[str, Any]:
     score = fuzz.partial_ratio(address.lower(), ocr_text.lower())
     return {"matched": score > threshold, "score": score}
 
-# ---------- FastAPI app ----------
+# ---------- API Endpoints ----------
 
-app = FastAPI(title="Certificate Verification API")
-
-# Allow CORS for local testing (adjust origins in production)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-executor = ThreadPoolExecutor(max_workers=4)
-
-# Health
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-# Single endpoint: upload files and run verification
 @app.post("/verify")
 async def verify(
-    cert: UploadFile = File(...),
-    selfie: UploadFile = File(...),
-    name: str = "",
-    address: str = "",
-    blur_threshold: float = 1000.0,
-    blank_threshold: float = 10.0,
-    name_threshold: int = 80,
-    address_threshold: int = 80,
+    cert_url: str,
+    selfie_url: str,
+    name: str,
+    address: str,
 ):
-    # save uploads
-    cert_path = save_upload_to_temp(cert)
-    selfie_path = save_upload_to_temp(selfie)
+    """
+    Verify certificate and selfie provided as URLs.
+    Request parameters:
+      - cert_url (str): URL to the certificate image (Cloudinary or any HTTP(S) URL)
+      - selfie_url (str): URL to the selfie image
+      - name (str, optional): Name to verify against OCR (e.g., "Ishan Singh")
+      - address (str, optional): Address to verify against OCR
+    """
+    # Download images
+    try:
+        cert_tmp = download_url_to_temp(cert_url)
+        selfie_tmp = download_url_to_temp(selfie_url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     try:
-        # run checks concurrently in threadpool to avoid blocking event loop
         loop = asyncio.get_running_loop()
 
-        # blur and blank checks
-        blur_task = loop.run_in_executor(executor, is_blurry_path, cert_path, blur_threshold)
-        blank_task = loop.run_in_executor(executor, is_blank_path, cert_path, blank_threshold)
-        ocr_task = loop.run_in_executor(executor, extract_text_path, cert_path)
-        face_task = loop.run_in_executor(executor, verify_photo_paths, cert_path, selfie_path)
+        # Run blocking tasks in threadpool concurrently
+        blur_task = loop.run_in_executor(executor, is_blurry_path, cert_tmp)
+        blank_task = loop.run_in_executor(executor, is_blank_path, cert_tmp)
+        ocr_task = loop.run_in_executor(executor, extract_text_path, cert_tmp)
+        face_task = loop.run_in_executor(executor, verify_photo_paths, cert_tmp, selfie_tmp)
 
         blur_res, blank_res, ocr_text, face_res = await asyncio.gather(blur_task, blank_task, ocr_task, face_task)
 
-        # name/address verification (run locally)
-        name_ver = verify_name_in_text(ocr_text, name or "", threshold=name_threshold) if name else {"matched": None}
-        address_ver = verify_address_in_text(ocr_text, address or "", threshold=address_threshold) if address else {"matched": None}
+        # Name and address verification (if provided)
+        name_ver = verify_name_in_text(ocr_text, name) if name else {"matched": None}
+        address_ver = verify_address_in_text(ocr_text, address) if address else {"matched": None}
 
         response = {
             "checks": {
@@ -173,7 +197,7 @@ async def verify(
                 "is_blank": bool(blank_res[0]),
                 "blank_stddev": blank_res[1],
             },
-            "face_verification": face_res,  # full DeepFace response
+            "face_verification": face_res,  # raw DeepFace response (contains 'verified' boolean and distances)
             "ocr_text": ocr_text,
             "name_verification": name_ver,
             "address_verification": address_ver,
@@ -181,28 +205,26 @@ async def verify(
         return JSONResponse(content=response)
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
     finally:
-        # cleanup temp files
-        try:
-            os.remove(cert_path)
-        except Exception:
-            pass
-        try:
-            os.remove(selfie_path)
-        except Exception:
-            pass
+        cleanup_file(cert_tmp)
+        cleanup_file(selfie_tmp)
 
-# Smaller convenience endpoint: just OCR
 @app.post("/ocr")
-async def ocr_only(cert: UploadFile = File(...)):
-    cert_path = save_upload_to_temp(cert)
+async def ocr_only(cert_url: str):
+    """
+    OCR-only endpoint that accepts an image URL and returns normalized OCR text.
+    """
+    try:
+        cert_tmp = download_url_to_temp(cert_url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     try:
         loop = asyncio.get_running_loop()
-        ocr_text = await loop.run_in_executor(executor, extract_text_path, cert_path)
+        ocr_text = await loop.run_in_executor(executor, extract_text_path, cert_tmp)
         return {"ocr_text": ocr_text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
     finally:
-        try:
-            os.remove(cert_path)
-        except Exception:
-            pass
+        cleanup_file(cert_tmp)
